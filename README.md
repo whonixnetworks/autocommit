@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/autocommit.png" alt="logo" width="100"/>
+  <img src="assets/autocommit.png" alt="logo" width="300"/>
 </p>
 
 AI-powered Git commit message generator using Ollama models. Automatically analyzes your code changes and generates meaningful commit messages.
