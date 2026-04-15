@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # autocommit — Git Auto Committer using Ollama models
 # Author: greedy
-# Version: 1.2.5
+# Version: 1.3.0
 # License: MIT
 
 import os
@@ -19,7 +19,7 @@ import fnmatch
 DEFAULT_MODEL = "llama3.2:3b"  # Alternative: "qwen2.5:3b" or "qwen2.5-coder:7b-instruct"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_REMOTE = "origin"
-VERSION = "1.2.5"
+VERSION = "1.3.0"
 
 def get_default_model() -> str:
     """Get default model from config file - shouldn't crash if config is malformed"""
@@ -772,7 +772,135 @@ Commit message:"""
             log_error(f"Failed to push: {output}")
             return False
     
-    def run(self, push: bool = True, remote: str = DEFAULT_REMOTE, branch: Optional[str] = None, auto_accept: bool = False) -> bool:
+    def normalize_version(self, version: str) -> str:
+        if not version:
+            return version
+        version = version.strip()
+        if not version.startswith('v'):
+            version = f"v{version}"
+        return version
+
+    def create_tag(self, version: str) -> bool:
+        tag_version = self.normalize_version(version)
+        log_info(f"Creating annotated tag: {tag_version}")
+        success, output = self.run_git_command(["tag", "-a", tag_version, "-m", f"Release {tag_version}"])
+        if success:
+            log_success(f"Tag {tag_version} created")
+            return True
+        else:
+            log_error(f"Failed to create tag: {output}")
+            return False
+
+    def push_tag(self, version: str, remote: str = DEFAULT_REMOTE) -> bool:
+        tag_version = self.normalize_version(version)
+        log_info(f"Pushing tag {tag_version} to {remote}")
+        success, output = self.run_git_command(["push", remote, tag_version])
+        if success:
+            log_success(f"Tag {tag_version} pushed to {remote}")
+            return True
+        else:
+            log_error(f"Failed to push tag: {output}")
+            return False
+
+    def check_gh_cli(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["gh", "auth", "status"],
+                capture_output=True,
+                text=True,
+                cwd=self.git_dir
+            )
+            if result.returncode == 0:
+                return True
+            else:
+                log_warning("gh CLI is not authenticated. Run 'gh auth login' first.")
+                return False
+        except FileNotFoundError:
+            log_warning("gh CLI is not installed. Install from https://cli.github.com")
+            return False
+
+    def generate_release_notes(self, git_diff: str) -> str:
+        if not git_diff:
+            return f"Release {self.normalize_version(self._pending_tag_version)}"
+
+        prompt = f"""Generate concise release notes for version {self._pending_tag_version} based on the following git diff. 
+Write the notes in markdown format with a brief summary followed by key changes as bullet points. 
+Do not include a title heading - start directly with the summary paragraph.
+
+Git diff:
+{git_diff[:4000]}
+
+Release notes:"""
+
+        try:
+            response = requests.post(
+                f"{self.ollama_url}/api/chat",
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant that writes release notes. Only output the release notes, no explanations."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 300
+                    },
+                    "think": False
+                },
+                timeout=120
+            )
+            response.raise_for_status()
+            result = response.json()
+            notes = result.get("message", {}).get("content", "").strip()
+            if notes:
+                log_success("Release notes generated via AI")
+                return notes
+        except Exception as e:
+            log_warning(f"Failed to generate AI release notes: {e}")
+
+        file_changes, changed_files = self.extract_file_changes_summary(git_diff)
+        fallback = f"Release {self.normalize_version(self._pending_tag_version)}\n\n{file_changes}"
+        log_info("Using auto-generated release notes")
+        return fallback
+
+    def create_github_release(self, version: str, notes: str, draft: bool = False, prerelease: bool = False) -> bool:
+        tag_version = self.normalize_version(version)
+        log_info(f"Creating GitHub release for {tag_version}")
+
+        if not self.check_gh_cli():
+            log_warning("Skipping GitHub release - gh CLI not available")
+            return False
+
+        cmd = [
+            "gh", "release", "create", tag_version,
+            "--title", tag_version,
+            "--notes", notes
+        ]
+
+        if draft:
+            cmd.append("--draft")
+        if prerelease:
+            cmd.append("--prerelease")
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=self.git_dir
+            )
+            if result.returncode == 0:
+                log_success(f"GitHub release {tag_version} created")
+                return True
+            else:
+                log_error(f"Failed to create release: {result.stderr.strip()}")
+                return False
+        except Exception as e:
+            log_error(f"Failed to create release: {e}")
+            return False
+
+    def run(self, push: bool = True, remote: str = DEFAULT_REMOTE, branch: Optional[str] = None, auto_accept: bool = False, tag_version: Optional[str] = None, release: bool = False, release_notes: Optional[str] = None, draft: bool = False, prerelease: bool = False, no_tag_push: bool = False) -> bool:
         """Main execution method."""
         show_header("Git Auto Committer")
         
@@ -905,8 +1033,31 @@ Commit message:"""
         
         # Push changes if requested
         if push:
-            return self.push_changes(remote, branch)
-        
+            if not self.push_changes(remote, branch):
+                return False
+
+        # Tag and release workflow
+        if tag_version:
+            normalized = self.normalize_version(tag_version)
+            self._pending_tag_version = normalized
+
+            if normalized.lstrip('v') != VERSION:
+                log_warning(f"Tag version {normalized} does not match script VERSION v{VERSION}")
+
+            if not self.create_tag(normalized):
+                return False
+
+            if not no_tag_push:
+                if not self.push_tag(normalized, remote):
+                    return False
+
+            if release:
+                notes = release_notes
+                if not notes:
+                    notes = self.generate_release_notes(git_diff)
+                if not self.create_github_release(normalized, notes, draft, prerelease):
+                    log_warning("Tag was created but GitHub release failed")
+
         return True
 
 def select_model() -> bool:
@@ -1129,12 +1280,25 @@ def show_help() -> None:
     print(f"  {Colors.BLUE}ℹ{Colors.NC} {Colors.WHITE}-v, --version{Colors.NC}      Show version")
     print()
     
+    show_section("Tag & Release Flags")
+    print(f"  {Colors.GREEN}✓{Colors.NC} {Colors.WHITE}--tag VERSION{Colors.NC}        Create annotated git tag (e.g. v1.2.6 or 1.2.6)")
+    print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}--release{Colors.NC}             Publish a GitHub release via gh CLI (requires --tag)")
+    print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}--release-notes TEXT{Colors.NC}  Custom release notes (omit for AI-generated)")
+    print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}--draft{Colors.NC}               Create the GitHub release as a draft")
+    print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}--prerelease{Colors.NC}          Mark the GitHub release as a pre-release")
+    print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}--no-tag-push{Colors.NC}         Create tag locally without pushing")
+    print()
+    
     show_section("Examples")
     print(f"  {Colors.GRAY}autocommit{Colors.NC}")
     print(f"  {Colors.GRAY}autocommit --model qwen2.5-coder:7b-instruct{Colors.NC}")
     print(f"  {Colors.GRAY}autocommit --no-push --remote upstream --branch develop{Colors.NC}")
     print(f"  {Colors.GRAY}autocommit -y{Colors.NC}                          # Auto-accept and push")
     print(f"  {Colors.GRAY}autocommit -y --no-push{Colors.NC}                 # Auto-accept without push")
+    print(f"  {Colors.GRAY}autocommit --tag v1.2.6{Colors.NC}                 # Tag only")
+    print(f"  {Colors.GRAY}autocommit -y --tag v1.2.6 --release{Colors.NC}    # Tag + release")
+    print(f"  {Colors.GRAY}autocommit -y --tag v1.2.6 --release --draft --prerelease{Colors.NC}")
+    print(f"  {Colors.GRAY}autocommit --tag v1.2.6 --no-tag-push{Colors.NC}   # Tag locally only")
     print()
 
     show_section(".autocommit-ignore")
@@ -1260,6 +1424,48 @@ def main() -> None:
         help="Skip confirmation and auto-accept commit"
     )
     
+    parser.add_argument(
+        "--tag",
+        default=None,
+        metavar="VERSION",
+        help="Create an annotated git tag (e.g. v1.2.6 or 1.2.6)"
+    )
+    
+    parser.add_argument(
+        "--release",
+        action="store_true",
+        default=False,
+        help="Publish a GitHub release via gh CLI (requires --tag)"
+    )
+    
+    parser.add_argument(
+        "--release-notes",
+        default=None,
+        metavar="TEXT",
+        help="Custom release notes (omit for AI-generated notes)"
+    )
+    
+    parser.add_argument(
+        "--draft",
+        action="store_true",
+        default=False,
+        help="Create the GitHub release as a draft"
+    )
+    
+    parser.add_argument(
+        "--prerelease",
+        action="store_true",
+        default=False,
+        help="Mark the GitHub release as a pre-release"
+    )
+    
+    parser.add_argument(
+        "--no-tag-push",
+        action="store_true",
+        default=False,
+        help="Create the tag locally without pushing it"
+    )
+    
     # Parse arguments
     args, unknown = parser.parse_known_args()
     
@@ -1281,6 +1487,20 @@ def main() -> None:
         success = select_model()
         sys.exit(0 if success else 1)
     
+    # Validate flag combinations
+    if args.release and not args.tag:
+        log_error("--release requires --tag to specify a version")
+        sys.exit(1)
+    
+    if args.draft and not args.release:
+        log_warning("--draft has no effect without --release")
+    
+    if args.prerelease and not args.release:
+        log_warning("--prerelease has no effect without --release")
+    
+    if args.release_notes and not args.release:
+        log_warning("--release-notes has no effect without --release")
+    
     try:
         committer = GitAutoCommitter(
             model=args.model,
@@ -1291,7 +1511,13 @@ def main() -> None:
             push=args.push,
             remote=args.remote,
             branch=args.branch,
-            auto_accept=args.yes
+            auto_accept=args.yes,
+            tag_version=args.tag,
+            release=args.release,
+            release_notes=args.release_notes,
+            draft=args.draft,
+            prerelease=args.prerelease,
+            no_tag_push=args.no_tag_push
         )
         
         sys.exit(0 if success else 1)
