@@ -1,0 +1,1307 @@
+#!/usr/bin/env python3
+# autocommit — Git Auto Committer using Ollama models
+# Author: greedy
+# Version: 1.2.5
+# License: MIT
+
+import os
+import sys
+import subprocess
+import json
+import argparse
+from pathlib import Path
+from typing import Optional, Tuple, List, Dict, Set
+import requests
+from datetime import datetime
+import fnmatch
+
+# CONFIGURATION
+DEFAULT_MODEL = "llama3.2:3b"  # Alternative: "qwen2.5:3b" or "qwen2.5-coder:7b-instruct"
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+DEFAULT_REMOTE = "origin"
+VERSION = "1.2.5"
+
+def get_default_model() -> str:
+    """Get default model from config file - shouldn't crash if config is malformed"""
+    config_file = Path.home() / ".config" / "autocommit" / "config.json"
+    if config_file.exists():
+        try:
+            config_data = json.loads(config_file.read_text())
+            if "default_model" in config_data:
+                return config_data["default_model"]
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return DEFAULT_MODEL
+
+# Color definitions - Standard palette from RULES.md
+class Colors:
+    RED = '\033[0;31m'
+    GREEN = '\033[0;32m'
+    YELLOW = '\033[1;33m'
+    BLUE = '\033[0;34m'
+    CYAN = '\033[0;36m'
+    MAGENTA = '\033[0;35m'
+    WHITE = '\033[1;37m'
+    GRAY = '\033[0;90m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    NC = '\033[0m'  # No Color
+
+# Helper functions for styled output
+def log_info(message: str) -> None:
+    print(f"{Colors.BLUE}[INFO]{Colors.NC} {message}")
+
+def log_success(message: str) -> None:
+    print(f"{Colors.GREEN}[✓]{Colors.NC} {message}")
+
+def log_warning(message: str) -> None:
+    print(f"{Colors.YELLOW}[WARNING]{Colors.NC} {message}")
+
+def log_error(message: str) -> None:
+    print(f"{Colors.RED}[ERROR]{Colors.NC} {message}")
+
+def show_header(title: str) -> None:
+    width = 40
+    print(f"{Colors.BLUE}{'=' * width}{Colors.NC}")
+    print(f"{Colors.BLUE}   {title}{Colors.NC}")
+    print(f"{Colors.BLUE}{'=' * width}{Colors.NC}")
+    print()
+
+def show_section(title: str) -> None:
+    print(f"{Colors.MAGENTA}=== {title} ==={Colors.NC}")
+
+def show_status(status: str, message: str) -> None:
+    if status == "required":
+        print(f"  {Colors.GREEN}✓{Colors.NC} {message}")
+    elif status == "optional":
+        print(f"  {Colors.YELLOW}○{Colors.NC} {message}")
+    elif status == "info":
+        print(f"  {Colors.BLUE}ℹ{Colors.NC} {message}")
+    elif status == "error":
+        print(f"  {Colors.RED}✗{Colors.NC} {message}")
+    else:
+        print(f"  {message}")
+
+def die(message: str) -> None:
+    """Fatal error handler - shouldn't fail silently"""
+    log_error(f"FATAL: {message}")
+    sys.exit(1)
+
+class GitAutoCommitter:
+    def __init__(self, model: str = None, ollama_url: str = DEFAULT_OLLAMA_URL):
+        self.model = model or get_default_model()
+        self.ollama_url = ollama_url
+        self.git_dir = self.find_git_root()
+        
+    def find_git_root(self) -> Optional[Path]:
+        """Find the git repository root directory."""
+        current = Path.cwd()
+        while current != current.parent:
+            if (current / ".git").exists():
+                return current
+            current = current.parent
+        return None
+    
+    def run_git_command(self, command: List[str]) -> Tuple[bool, str]:
+        """Run a git command - shouldn't crash if git fails, should return error details"""
+        try:
+            result = subprocess.run(
+                ["git"] + command,
+                cwd=self.git_dir,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return True, result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            return False, f"{e.stderr.strip()}\nExit code: {e.returncode}"
+    
+    def get_git_status(self) -> str:
+        """Get git status output."""
+        success, output = self.run_git_command(["status"])
+        if not success:
+            log_error(f"Failed to get git status: {output}")
+            return ""
+        return output
+    
+    def get_git_diff(self) -> str:
+        """Get git diff output."""
+        success, output = self.run_git_command(["diff", "--staged"])
+        if not success or not output:
+            # Try unstaged diff if no staged changes
+            success, output = self.run_git_command(["diff"])
+            if not success:
+                log_error(f"Failed to get git diff: {output}")
+                return ""
+        return output
+    
+    def get_readme_content(self) -> str:
+        """Read README.md file if it exists."""
+        readme_path = self.git_dir / "README.md"
+        if readme_path.exists():
+            try:
+                return readme_path.read_text()
+            except Exception as e:
+                log_warning(f"Failed to read README.md: {e}")
+        return ""
+
+    def read_autocommit_ignore(self) -> Set[str]:
+        """Read .autocommit-ignore file and return set of patterns."""
+        ignore_file = self.git_dir / ".autocommit-ignore"
+        patterns = set()
+        
+        if ignore_file.exists():
+            try:
+                for line in ignore_file.read_text().split('\n'):
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        patterns.add(line)
+                if patterns:
+                    log_info(f"Loaded {len(patterns)} patterns from .autocommit-ignore")
+            except Exception as e:
+                log_warning(f"Failed to read .autocommit-ignore: {e}")
+        
+        return patterns
+
+    def is_ignored_by_autocommit(self, filename: str, patterns: Set[str]) -> bool:
+        """Check if a file matches any .autocommit-ignore pattern."""
+        for pattern in patterns:
+            # Handle directory patterns (ending with /)
+            if pattern.endswith('/'):
+                dir_path = pattern.rstrip('/')
+                if filename.startswith(dir_path + '/') or filename == dir_path:
+                    return True
+            # Handle wildcard patterns
+            if fnmatch.fnmatch(filename, pattern):
+                return True
+            # Handle prefix match
+            if filename.startswith(pattern.rstrip('/')):
+                return True
+        return False
+
+    def filter_ignored_files(self, files: List[str], patterns: Set[str]) -> Tuple[List[str], List[str]]:
+        """Separate ignored files from non-ignored files."""
+        ignored = []
+        non_ignored = []
+        
+        for f in files:
+            if self.is_ignored_by_autocommit(f, patterns):
+                ignored.append(f)
+            else:
+                non_ignored.append(f)
+        
+        return non_ignored, ignored
+
+    def generate_default_message(self) -> str:
+        """Generate default commit message with timestamp."""
+        now = datetime.now()
+        return f"Changes made: {now.strftime('%d:%m:%y')} - {now.strftime('%H:%M')}"
+
+    def check_gitignore_issues(self) -> List[str]:
+        """Check for files tracked by git but listed in .gitignore - shouldn't push generated files to remote"""
+        # Get list of tracked files that match .gitignore patterns
+        success, tracked_ignored = self.run_git_command(["ls-files", "-i", "--exclude-standard"])
+        if not success or not tracked_ignored:
+            return []
+        
+        files = [f.strip() for f in tracked_ignored.split('\n') if f.strip()]
+        return files
+
+    def suggest_gitignore_fix(self, files: List[str]) -> None:
+        """Show warning and suggest fix for tracked files in .gitignore"""
+        show_section("Gitignore Warning")
+        log_warning(f"Found {len(files)} tracked file(s) that match .gitignore patterns:")
+        
+        for f in files[:10]:  # Show first 10
+            print(f"  {Colors.RED}✗{Colors.NC} {Colors.WHITE}{f}{Colors.NC}")
+        
+        if len(files) > 10:
+            print(f"  {Colors.GRAY}... and {len(files) - 10} more{Colors.NC}")
+        
+        print()
+        log_info("These files should be removed from git tracking:")
+        print(f"{Colors.GRAY}  git rm -r --cached {' '.join(files[:3])} ...{Colors.NC}")
+        print(f"{Colors.GRAY}  git commit -m 'Remove generated files from tracking'{Colors.NC}")
+        print(f"{Colors.GRAY}  git push{Colors.NC}")
+        print()
+        log_info("Continuing with commit anyway...")
+        print()
+
+    def check_autocommit_ignore_tracked(self, patterns: Set[str]) -> List[str]:
+        """Check for files tracked by git that match .autocommit-ignore patterns."""
+        if not patterns:
+            return []
+        
+        success, tracked_files = self.run_git_command(["ls-files"])
+        if not success or not tracked_files:
+            return []
+        
+        tracked = [f.strip() for f in tracked_files.split('\n') if f.strip()]
+        matched = []
+        
+        for filepath in tracked:
+            if self.is_ignored_by_autocommit(filepath, patterns):
+                matched.append(filepath)
+        
+        return matched
+
+    def get_staged_ignored_files(self, patterns: Set[str]) -> List[str]:
+        """Get staged files that match .autocommit-ignore patterns."""
+        if not patterns:
+            return []
+        
+        success, staged = self.run_git_command(["diff", "--staged", "--name-only"])
+        if not success or not staged:
+            return []
+        
+        files = [f.strip() for f in staged.split('\n') if f.strip()]
+        matched = []
+        
+        for filepath in files:
+            if self.is_ignored_by_autocommit(filepath, patterns):
+                matched.append(filepath)
+        
+        return matched
+
+    def remove_tracked_ignored_files(self, files: List[str], auto_accept: bool = False, push: bool = True, remote: str = DEFAULT_REMOTE, branch: Optional[str] = None) -> bool:
+        """Remove tracked files that match .autocommit-ignore patterns from git."""
+        if not files:
+            return True
+        
+        success, status_output = self.run_git_command(["status", "--porcelain"])
+        if not success:
+            log_error(f"Failed to get git status: {status_output}")
+            return False
+        
+        already_tracked = []
+        new_staged = []
+        
+        for f in files:
+            if any(f in line and line.startswith(('M', 'A', 'D', 'R')) for line in status_output.split('\n')):
+                success, ls_files = self.run_git_command(["ls-files", f])
+                if success and ls_files.strip():
+                    already_tracked.append(f)
+                else:
+                    new_staged.append(f)
+        
+        if already_tracked:
+            show_section(".autocommit-ignore Cleanup")
+            log_warning(f"Found {len(already_tracked)} tracked file(s) that match .autocommit-ignore patterns:")
+            
+            for f in already_tracked[:10]:
+                print(f"  {Colors.RED}✗{Colors.NC} {Colors.WHITE}{f}{Colors.NC}")
+            
+            if len(already_tracked) > 10:
+                print(f"  {Colors.GRAY}... and {len(already_tracked) - 10} more{Colors.NC}")
+            
+            print()
+            
+            if auto_accept:
+                log_info("Auto-accept enabled (-y flag), removing files automatically")
+                should_remove = True
+            else:
+                response = input(f"{Colors.YELLOW}Remove these files from git tracking and push? y/n: {Colors.NC}").strip().lower()
+                should_remove = response == 'y'
+            
+            if not should_remove:
+                log_info("Skipping removal, files will remain tracked")
+                return True
+            
+            for f in already_tracked:
+                self.run_git_command(["rm", "--cached", f])
+            
+            log_success(f"Removed {len(already_tracked)} file(s) from git tracking")
+            
+            success, staged = self.run_git_command(["status", "--porcelain"])
+            if staged.strip():
+                commit_msg = self.generate_default_message()
+                success, output = self.run_git_command(["add", "."])
+                if not success:
+                    log_error(f"Failed to stage removal: {output}")
+                    return False
+                success, output = self.run_git_command(["commit", "-m", commit_msg])
+                if not success:
+                    log_error(f"Failed to commit removal: {output}")
+                    return False
+                
+                log_success("Committed removal of ignored files")
+                
+                if push:
+                    if not branch:
+                        success, current_branch = self.run_git_command(["branch", "--show-current"])
+                        if not success:
+                            log_error(f"Failed to get current branch: {current_branch}")
+                            return False
+                        branch = current_branch.strip()
+                    
+                    log_info(f"Pushing removal to {remote}/{branch}")
+                    success, output = self.run_git_command(["push", remote, branch])
+                    if not success:
+                        log_error(f"Failed to push: {output}")
+                        return False
+                    
+                    log_success(f"Pushed removal to {remote}/{branch}")
+        
+        if new_staged:
+            log_info(f"Unstaging {len(new_staged)} new file(s) matching .autocommit-ignore:")
+            for f in new_staged[:5]:
+                print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}{f}{Colors.NC}")
+            
+            for f in new_staged:
+                self.run_git_command(["reset", "HEAD", f])
+            
+            log_success(f"Unstaged {len(new_staged)} file(s) - they will remain local but won't be pushed")
+        
+        return True
+    
+    def extract_file_changes_summary(self, git_diff: str) -> Tuple[str, List[str]]:
+        """Extract a clean summary of file changes from git diff - shouldn't include files not in the actual diff"""
+        if not git_diff:
+            return "No changes", []
+        
+        lines = git_diff.split('\n')
+        files_modified = set()
+        files_added = set()
+        files_deleted = set()
+        all_changed_files = []
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith('diff --git'):
+                # Extract filename from diff --git a/filename b/filename
+                parts = line.split()
+                if len(parts) >= 4:
+                    file_a = parts[2][2:] if parts[2].startswith('a/') else parts[2]
+                    file_b = parts[3][2:] if parts[3].startswith('b/') else parts[3]
+                    
+                    # Look ahead for new file / deleted file markers
+                    is_new_file = False
+                    is_deleted_file = False
+                    
+                    # Check next few lines for file status
+                    for j in range(i + 1, min(i + 5, len(lines))):
+                        if lines[j].startswith('new file mode'):
+                            is_new_file = True
+                            break
+                        elif lines[j].startswith('deleted file mode'):
+                            is_deleted_file = True
+                            break
+                        elif lines[j].startswith('diff --git'):
+                            break
+                    
+                    # Categorize the file change
+                    if is_new_file:
+                        files_added.add(file_b)
+                        all_changed_files.append(file_b)
+                    elif is_deleted_file:
+                        files_deleted.add(file_a)
+                        all_changed_files.append(file_a)
+                    else:
+                        files_modified.add(file_b)
+                        all_changed_files.append(file_b)
+            i += 1
+        
+        summary_parts = []
+        if files_added:
+            files_list = ', '.join(sorted(files_added)[:5])
+            if len(files_added) > 5:
+                files_list += f" (and {len(files_added) - 5} more)"
+            summary_parts.append(f"Added: {files_list}")
+        if files_deleted:
+            files_list = ', '.join(sorted(files_deleted)[:5])
+            if len(files_deleted) > 5:
+                files_list += f" (and {len(files_deleted) - 5} more)"
+            summary_parts.append(f"Deleted: {files_list}")
+        if files_modified:
+            files_list = ', '.join(sorted(files_modified)[:5])
+            if len(files_modified) > 5:
+                files_list += f" (and {len(files_modified) - 5} more)"
+            summary_parts.append(f"Modified: {files_list}")
+        
+        if not summary_parts:
+            # Fallback to simple line counting
+            added_lines = sum(1 for line in lines if line.startswith('+') and not line.startswith('+++'))
+            removed_lines = sum(1 for line in lines if line.startswith('-') and not line.startswith('---'))
+            return f"Changes: +{added_lines} -{removed_lines} lines", []
+        
+        return "\n".join(summary_parts), all_changed_files
+    
+    def generate_commit_message(self, git_status: str, git_diff: str, readme_content: str) -> Optional[str]:
+        """Generate commit message using Ollama - shouldn't fail if Ollama is unreachable"""
+        show_section("Generating Commit Message")
+        
+
+        # Build prompt - request specific 3-part format
+        file_changes_summary, changed_files = self.extract_file_changes_summary(git_diff)
+        
+        prompt = f"""Write a Git commit message for this code change in EXACTLY this format:
+
+Line 1 (Heading): Brief description of what changed (max 72 chars)
+Line 2 (Subheading): Made (edit/delete/refine/add/update) to {{file_names}}
+Line 3+ (Body): 
+- Bullet point of specific change
+  Description of that change
+- Another bullet point
+  Another description
+
+The commit MUST have all three parts separated by newlines.
+
+Files changed:
+{file_changes_summary}
+
+Git diff:
+{git_diff[:2500]}
+
+Commit message:"""
+        
+        try:
+            # Use chat API format which works better with instruction-following models
+            response = requests.post(
+                f"{self.ollama_url}/api/chat",
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant that writes Git commit messages. Only output the commit message itself, no explanations or reasoning."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 200
+                    },
+                    "think": False  # Disable thinking mode for models like qwen3
+                },
+                timeout=120
+            )
+            response.raise_for_status()
+            result = response.json()
+            message_obj = result.get("message", {})
+            commit_message = message_obj.get("content", "").strip()
+            
+            # Check if model is outputting thinking content (e.g., qwen3 with thinking enabled)
+            # This can happen in 'thinking' field or directly in 'content' field
+            thinking_text = message_obj.get("thinking", "")
+            if not commit_message and thinking_text:
+                log_warning(f"Model {self.model} is outputting thinking/reasoning instead of direct answers.")
+                log_info("This is common with qwen3 models. To fix this, use the -instruct variant:")
+                log_info(f"  autocommit --model {self.model.replace(':4b', ':4b-instruct')}")
+                log_info("Or select a different model: autocommit --select-model")
+                return self.generate_fallback_message(git_diff)
+            
+            # Also check if content itself looks like thinking text (qwen3 chat mode)
+            if commit_message and any(phrase in commit_message.lower() for phrase in ['we are given', 'the diff shows', 'we can see', 'the change is', 'looking at']):
+                log_warning(f"Model {self.model} appears to be outputting analysis instead of commit message.")
+                log_info("Tip: Use qwen3:4b-instruct or qwen2.5-coder:7b-instruct for better results.")
+                return self.generate_fallback_message(git_diff)
+            
+            if commit_message:
+                # Clean up the response
+                commit_message = commit_message.strip()
+                
+                # Remove common prefixes
+                prefixes = [
+                    "here is a suitable git commit message:",
+                    "commit message:",
+                    "git commit message:",
+                    "suggested commit message:",
+                    "here's a commit message:",
+                    "here is the commit message:"
+                ]
+                
+                for prefix in prefixes:
+                    if commit_message.lower().startswith(prefix.lower()):
+                        commit_message = commit_message[len(prefix):].strip()
+                        if commit_message.startswith(':'):
+                            commit_message = commit_message[1:].strip()
+                
+                # Remove section labels (TITLE, SUBTITLE, BODY, and their variants)
+                import re
+                # Pattern to match "TITLE:", "SUBTITLE:", "BODY:" at start of lines (case insensitive)
+                commit_message = re.sub(r'(?im)^\s*(title|subtitle|body)\s*:?\s*', '', commit_message)
+                
+                # Parse the 3-part format: Heading, Subheading, Body
+                lines = commit_message.split('\n')
+                
+                # Clean lines and remove markdown artifacts
+                clean_lines = []
+                for line in lines:
+                    line = line.strip('`"\'').strip()
+                    # Skip empty lines and markdown
+                    if line and not line.startswith('```') and not line.startswith('**'):
+                        clean_lines.append(line)
+                
+                if clean_lines:
+                    # Extract heading (first line)
+                    heading = clean_lines[0]
+                    if len(heading) > 72:
+                        heading = heading[:69] + "..."
+                    
+                    # Extract subheading (second line, or generate from files)
+                    subheading = ""
+                    if len(clean_lines) > 1:
+                        subheading = clean_lines[1]
+                    else:
+                        # Generate subheading from file changes
+                        file_changes, _ = self.extract_file_changes_summary(git_diff)
+                        if "Added:" in file_changes:
+                            subheading = f"Added new files"
+                        elif "Modified:" in file_changes:
+                            subheading = f"Modified existing files"
+                        elif "Deleted:" in file_changes:
+                            subheading = f"Deleted files"
+                        else:
+                            subheading = "Updated files"
+                    
+                    # Extract body (remaining lines with bullet points)
+                    body_lines = []
+                    if len(clean_lines) > 2:
+                        for line in clean_lines[2:]:
+                            # Keep bullet points and their descriptions
+                            if line.startswith('-') or line.startswith('*'):
+                                body_lines.append(line)
+                            elif body_lines and not line.startswith('-') and not line.startswith('*'):
+                                # This is a description line after a bullet
+                                body_lines.append(f"  {line}")
+                    
+                    # If no proper body, generate one from diff
+                    if not body_lines:
+                        file_changes, changed_files = self.extract_file_changes_summary(git_diff)
+                        body_lines.append(f"- Updated {len(changed_files)} file(s)")
+                        body_lines.append(f"  {file_changes.replace(chr(10), ', ')}")
+                    
+                    # Build final message in 3-part format
+                    body = "\n".join(body_lines)
+                    final_message = f"{heading}\n{subheading}\n{body}"
+                    
+                    log_success("Commit message generated successfully")
+                    return final_message
+            
+            # Fallback: generate a simple commit message based on file changes
+            log_warning("Using fallback commit message generation. Ollama might not have returned a valid message or the message was cleaned too aggressively.")
+            return self.generate_fallback_message(git_diff)
+                
+        except requests.exceptions.RequestException as e:
+            log_error(f"Failed to connect to Ollama: {e}")
+            log_info("Make sure Ollama is running: 'ollama serve'")
+            return None
+        except json.JSONDecodeError as e:
+            log_error(f"Invalid response from Ollama: {e}")
+            return None
+    
+    def generate_fallback_message(self, git_diff: str) -> str:
+        """Generate fallback commit message in 3-part format: heading, subheading, body"""
+        file_changes, changed_files = self.extract_file_changes_summary(git_diff)
+        
+        # Create commit message in 3-part format
+        if "Added:" in file_changes and "Modified:" not in file_changes and "Deleted:" not in file_changes:
+            files_str = file_changes.split("Added:")[1].strip().split('\n')[0]
+            if len(changed_files) == 1:
+                heading = f"Add {changed_files[0]}"
+                subheading = f"Added new file {changed_files[0]}"
+            else:
+                heading = "Add new files"
+                subheading = f"Added {len(changed_files)} new files"
+            body = f"- Add {len(changed_files)} new file(s)\n  Introduce new functionality to the project"
+            
+        elif "Modified:" in file_changes and "Added:" not in file_changes and "Deleted:" not in file_changes:
+            files_str = file_changes.split("Modified:")[1].strip().split('\n')[0]
+            heading = "Update existing files"
+            subheading = f"Modified {len(changed_files)} file(s)"
+            body = f"- Update {len(changed_files)} file(s)\n  Improve functionality and performance\n- Modified files: {files_str}"
+            
+        elif "Deleted:" in file_changes:
+            heading = "Remove unused code"
+            subheading = f"Deleted {len(changed_files)} file(s)"
+            body = "- Remove deprecated files\n  Clean up codebase to reduce clutter"
+            
+        else:
+            heading = "Update project files"
+            subheading = f"Modified {len(changed_files)} file(s)"
+            body = f"- Update multiple files\n  Make various improvements and fixes\n- Files changed: {', '.join(changed_files[:3])}"
+        
+        return f"{heading}\n{subheading}\n{body}"
+    
+    def stage_changes(self) -> bool:
+        """Stage all changes."""
+        show_section("Staging Changes")
+        
+        # Check if there are any changes to stage
+        success, status = self.run_git_command(["status", "--porcelain"])
+        if not success:
+            log_error(f"Failed to check git status: {status}")
+            return False
+        
+        if not status:
+            log_warning("No changes to stage")
+            return False
+        
+        # Parse porcelain output to understand what needs staging
+        lines = status.strip().split('\n')
+        staged_files = []
+        unstaged_files = []
+        
+        for line in lines:
+            if len(line) >= 2:
+                status_code = line[:2]
+                filename = line[3:].strip()
+                
+                # M = modified, A = added, D = deleted, R = renamed, C = copied
+                # First char: staged status, Second char: unstaged status
+                if status_code[0] in 'MADRC':
+                    staged_files.append(filename)
+                if status_code[1] in 'MADRC':
+                    unstaged_files.append(filename)
+        
+        # Count new files specifically
+        new_files = []
+        for line in lines:
+            if len(line) >= 2:
+                status_code = line[:2]
+                filename = line[3:].strip()
+                if status_code[0] == '?' or status_code == 'A ':
+                    new_files.append(filename)
+        
+        log_info(f"Found {len(staged_files)} staged files, {len(unstaged_files)} unstaged files")
+        if new_files:
+            log_info(f"New files detected: {', '.join(new_files[:5])}")
+        
+        # ALWAYS stage all changes to ensure consistent behavior
+        # This addresses the user's feedback about needing to run git add .
+        success, output = self.run_git_command(["add", "."])
+        if success:
+            if unstaged_files:
+                log_success(f"Staged {len(unstaged_files)} file(s)")
+                if new_files:
+                    log_success(f"Newly added: {', '.join(new_files[:5])}")
+            else:
+                log_info("All changes already staged")
+            return True
+        else:
+            log_error(f"Failed to stage changes: {output}")
+            return False
+    
+    def commit_changes(self, message: str) -> bool:
+        """Commit changes with the generated message using exactly three -m flags (heading, subheading, body)."""
+        show_section("Committing Changes")
+        
+        # Validate commit message
+        if not message or len(message.strip()) == 0:
+            log_error("Empty commit message")
+            return False
+        
+        # Parse the 3-part message
+        lines = message.strip().split('\n')
+        
+        if len(lines) == 1:
+            # Single-line message (default message from .autocommit-ignore)
+            heading = lines[0].strip()
+            subheading = "Updated files"
+            body = "Auto-committed changes"
+        elif len(lines) < 2:
+            log_error("Commit message must have at least heading and subheading")
+            return False
+        else:
+            # Extract heading (line 1)
+            heading = lines[0].strip()
+            
+            # Extract subheading (line 2)
+            subheading = lines[1].strip()
+            
+            # Extract body (remaining lines)
+            body_lines = []
+            for line in lines[2:]:
+                if line.strip():
+                    body_lines.append(line.strip())
+            
+            body = "\n".join(body_lines) if body_lines else "Updated files"
+        
+        # Build commit command with exactly 3 -m flags
+        commit_args = ["commit", "-m", heading, "-m", subheading, "-m", body]
+
+        success, output = self.run_git_command(commit_args)
+        if success:
+            log_success(f"Committed successfully")
+            print(f"{Colors.CYAN}Heading:{Colors.NC} {heading}")
+            print(f"{Colors.CYAN}Subheading:{Colors.NC} {subheading}")
+            print(f"{Colors.CYAN}Body:{Colors.NC}")
+            if len(lines) == 1:
+                print(f"  {Colors.GRAY}{body}{Colors.NC}")
+            else:
+                for line in body_lines:
+                    print(f"  {line}")
+            return True
+        else:
+            log_error(f"Failed to commit: {output}")
+            return False
+    
+    def push_changes(self, remote: str = DEFAULT_REMOTE, branch: Optional[str] = None) -> bool:
+        """Push changes to remote repository."""
+        show_section("Pushing Changes")
+        
+        # Check if remote exists
+        success, remotes = self.run_git_command(["remote"])
+        if not success:
+            log_error(f"Failed to check remotes: {remotes}")
+            return False
+        
+        if remote not in remotes.split():
+            log_warning(f"Remote '{remote}' not found. Available remotes: {remotes}")
+            log_info("Skipping push - no remote configured")
+            return True  # Return True to not fail the whole process
+        
+        # Get current branch if not specified
+        if not branch:
+            success, current_branch = self.run_git_command(["branch", "--show-current"])
+            if not success:
+                log_error(f"Failed to get current branch: {current_branch}")
+                return False
+            branch = current_branch.strip()
+        
+        if not branch:
+            log_error("No branch specified and could not determine current branch")
+            return False
+        
+        log_info(f"Pushing to {remote}/{branch}")
+        success, output = self.run_git_command(["push", remote, branch])
+        
+        if success:
+            log_success(f"Successfully pushed to {remote}/{branch}")
+            return True
+        else:
+            log_error(f"Failed to push: {output}")
+            return False
+    
+    def run(self, push: bool = True, remote: str = DEFAULT_REMOTE, branch: Optional[str] = None, auto_accept: bool = False) -> bool:
+        """Main execution method."""
+        show_header("Git Auto Committer")
+        
+        # Check if we're in a git repository
+        if not self.git_dir:
+            log_error("Not in a git repository")
+            return False
+
+        log_info(f"Repository: {self.git_dir}")
+        log_info(f"Using model: {self.model}")
+
+        # Check for tracked files that should be ignored
+        tracked_ignored_files = self.check_gitignore_issues()
+        if tracked_ignored_files:
+            self.suggest_gitignore_fix(tracked_ignored_files)
+
+        # Read .autocommit-ignore file
+        ignore_patterns = self.read_autocommit_ignore()
+
+        # Get git status first
+        git_status = self.get_git_status()
+        if not git_status:
+            return False
+        
+        # Stage changes before getting diff
+        if not self.stage_changes():
+            return False
+        
+        # Check for staged ignored files that are already tracked - prompt for removal
+        if ignore_patterns:
+            staged_ignored = self.get_staged_ignored_files(ignore_patterns)
+            if staged_ignored:
+                if not self.remove_tracked_ignored_files(staged_ignored, auto_accept, push, remote, branch):
+                    return False
+        
+        # Get git diff after staging
+        git_diff = self.get_git_diff()
+        if not git_diff:
+            log_warning("No changes detected")
+            return False
+        
+        # Extract changed files and filter by .autocommit-ignore
+        _, all_changed_files = self.extract_file_changes_summary(git_diff)
+        non_ignored_files, ignored_files = self.filter_ignored_files(all_changed_files, ignore_patterns)
+        
+        if ignored_files:
+            log_info(f"Ignored files (from .autocommit-ignore): {', '.join(ignored_files[:5])}")
+            if len(ignored_files) > 5:
+                log_info(f"  ... and {len(ignored_files) - 5} more")
+        
+        readme_content = self.get_readme_content()
+        
+        # Determine commit message based on ignored files
+        if ignored_files and not non_ignored_files:
+            # Only ignored files - use default message
+            log_info("Only .autocommit-ignore files changed, using default message")
+            commit_message = self.generate_default_message()
+        elif ignored_files and non_ignored_files:
+            # Both ignored and non-ignored - generate message for non-ignored only
+            log_info(f"Generating commit message for {len(non_ignored_files)} non-ignored file(s)")
+            
+            # Filter git_diff to only include non-ignored files
+            filtered_diff_lines = []
+            current_file = None
+            for line in git_diff.split('\n'):
+                if line.startswith('diff --git'):
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        file_b = parts[3][2:] if parts[3].startswith('b/') else parts[3]
+                        current_file = file_b
+                        if self.is_ignored_by_autocommit(current_file, ignore_patterns):
+                            current_file = None
+                if current_file is not None:
+                    filtered_diff_lines.append(line)
+            
+            filtered_diff = '\n'.join(filtered_diff_lines)
+            
+            # Generate message with filtered diff
+            commit_message = self.generate_commit_message(git_status, filtered_diff, readme_content)
+            if not commit_message:
+                return False
+        else:
+            # No ignored files - normal behavior
+            commit_message = self.generate_commit_message(git_status, git_diff, readme_content)
+            if not commit_message:
+                return False
+        
+        # Ask for confirmation
+        show_section("Confirmation")
+        is_default = ignored_files and not non_ignored_files
+        if is_default:
+            print(f"{Colors.YELLOW}Generated commit message (default - only ignored files):{Colors.NC}")
+        else:
+            print(f"{Colors.YELLOW}Generated commit message (3-part format):{Colors.NC}")
+        print()
+        
+        # Parse and display the 3-part message
+        lines = commit_message.strip().split('\n')
+        if len(lines) >= 2:
+            print(f"{Colors.CYAN}Heading:{Colors.NC}")
+            print(f"  {Colors.WHITE}{lines[0]}{Colors.NC}")
+            print()
+            print(f"{Colors.CYAN}Subheading:{Colors.NC}")
+            print(f"  {Colors.WHITE}{lines[1]}{Colors.NC}")
+            print()
+            if len(lines) > 2:
+                print(f"{Colors.CYAN}Body:{Colors.NC}")
+                for line in lines[2:]:
+                    print(f"  {Colors.GRAY}{line}{Colors.NC}")
+                print()
+        else:
+            # Fallback display
+            print(f"{Colors.WHITE}{commit_message}{Colors.NC}")
+            print()
+        
+        if auto_accept:
+            log_info("Auto-accept enabled (-y flag), skipping confirmation")
+        else:
+            response = input(f"{Colors.YELLOW}Accept and push commit? y/n: {Colors.NC}").strip().lower()
+            
+            if response != 'y':
+                log_warning("Operation cancelled by user")
+                # Undo staged changes
+                self.run_git_command(["reset", "--mixed", "HEAD"])
+                return False
+        
+        # Commit changes
+        if not self.commit_changes(commit_message):
+            return False
+        
+        # Push changes if requested
+        if push:
+            return self.push_changes(remote, branch)
+        
+        return True
+
+def select_model() -> bool:
+    """Show available Ollama models and allow selection."""
+    show_header("Select Ollama Model")
+    
+    try:
+        # Run ollama list command
+        result = subprocess.run(
+            ["ollama", "list"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        models_output = result.stdout.strip()
+        if not models_output:
+            log_error("No models found. Install models with 'ollama pull <model-name>'")
+            return False
+        
+        # Parse models from output
+        lines = models_output.split('\n')
+        models = []
+        
+        # Skip header line if present
+        start_idx = 1 if lines[0].startswith('NAME') else 0
+        for line in lines[start_idx:]:
+            if line.strip():
+                # Extract model name (first column)
+                model_name = line.split()[0]
+                models.append(model_name)
+        
+        if not models:
+            log_error("No models available")
+            return False
+        
+        # Display models with numbers
+        print(f"{Colors.CYAN}Available models:{Colors.NC}")
+        for i, model in enumerate(models, 1):
+            print(f"  {Colors.WHITE}{i}.{Colors.NC} {model}")
+        
+        print()
+        
+        # Get user selection
+        while True:
+            try:
+                selection = input(f"{Colors.YELLOW}Select model (1-{len(models)}): {Colors.NC}").strip()
+                if not selection:
+                    log_warning("Selection cancelled")
+                    return False
+                
+                index = int(selection) - 1
+                if 0 <= index < len(models):
+                    selected_model = models[index]
+                    break
+                else:
+                    print(f"{Colors.RED}Please enter a number between 1 and {len(models)}{Colors.NC}")
+            except ValueError:
+                print(f"{Colors.RED}Please enter a valid number{Colors.NC}")
+        
+        # Save selected model to config file
+        config_dir = Path.home() / ".config" / "autocommit"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_file = config_dir / "config.json"
+        
+        config_data = {}
+        if config_file.exists():
+            try:
+                config_data = json.loads(config_file.read_text())
+            except json.JSONDecodeError:
+                pass
+        
+        config_data["default_model"] = selected_model
+        
+        try:
+            config_file.write_text(json.dumps(config_data, indent=2))
+            log_success(f"Default model set to: {selected_model}")
+            log_info(f"Configuration saved to: {config_file}")
+            return True
+        except Exception as e:
+            log_error(f"Failed to save configuration: {e}")
+            return False
+            
+    except subprocess.CalledProcessError as e:
+        log_error(f"Failed to list Ollama models: {e}")
+        log_info("Make sure Ollama is installed and running")
+        return False
+    except FileNotFoundError:
+        log_error("Ollama not found. Install Ollama from https://ollama.com")
+        return False
+
+def install_to_path() -> bool:
+    """Install autocommit to system PATH."""
+    show_header("Installing autocommit")
+    
+    # Get the current script path
+    script_path = Path(__file__).resolve()
+    
+    # Common installation directories
+    install_dirs = [
+        Path.home() / ".local" / "bin",
+        Path("/usr") / "local" / "bin",
+        Path("/usr") / "bin"
+    ]
+    
+    # Try to find a writable directory
+    install_dir = None
+    for dir_path in install_dirs:
+        try:
+            dir_path.mkdir(parents=True, exist_ok=True)
+            # Check if we can write to this directory
+            test_file = dir_path / ".test_write"
+            test_file.touch()
+            test_file.unlink()
+            install_dir = dir_path
+            log_info(f"Found writable directory: {install_dir}")
+            break
+        except (PermissionError, OSError):
+            continue
+    
+    if not install_dir:
+        log_error("No writable installation directory found")
+        log_info("Try running with sudo or install manually to ~/.local/bin")
+        return False
+    
+    # Create symlink
+    symlink_path = install_dir / "autocommit"
+    
+    try:
+        # Remove existing symlink if it exists
+        if symlink_path.exists():
+            symlink_path.unlink()
+        
+        # Create symlink
+        symlink_path.symlink_to(script_path)
+        log_success(f"Created symlink: {symlink_path} -> {script_path}")
+        
+        # Make script executable
+        script_path.chmod(0o755)
+        log_success(f"Made script executable: {script_path}")
+        
+        # Check if install_dir is in PATH
+        path_env = os.environ.get("PATH", "")
+        if str(install_dir) not in path_env:
+            log_warning(f"{install_dir} is not in your PATH")
+            
+            # Detect shell type
+            shell = os.environ.get("SHELL", "")
+            shell_config = None
+            
+            if "zsh" in shell:
+                shell_config = Path.home() / ".zshrc"
+                log_info(f"Detected zsh shell, updating {shell_config}")
+            elif "bash" in shell:
+                shell_config = Path.home() / ".bashrc"
+                log_info(f"Detected bash shell, updating {shell_config}")
+            else:
+                # Try to detect from common config files
+                for config_file in [".zshrc", ".bashrc", ".profile", ".bash_profile"]:
+                    config_path = Path.home() / config_file
+                    if config_path.exists():
+                        shell_config = config_path
+                        log_info(f"Found shell config: {shell_config}")
+                        break
+            
+            if shell_config:
+                # Check if PATH export already exists
+                path_export = f'export PATH="$PATH:{install_dir}"'
+                try:
+                    config_content = shell_config.read_text()
+                    
+                    if path_export in config_content:
+                        log_info(f"PATH export already exists in {shell_config}")
+                    else:
+                        # Add PATH export to shell config
+                        with open(shell_config, 'a') as f:
+                            f.write(f"\n# Added by autocommit installer\n{path_export}\n")
+                        log_success(f"Added PATH export to {shell_config}")
+                        log_info(f"Run 'source {shell_config}' or restart your terminal")
+                except Exception as e:
+                    log_warning(f"Could not update {shell_config}: {e}")
+                    log_info(f"Manually add this to your shell profile:")
+                    print(f"{Colors.WHITE}{path_export}{Colors.NC}")
+            else:
+                log_info("Could not detect shell configuration file")
+                log_info(f"Manually add this to your shell profile:")
+                print(f"{Colors.WHITE}export PATH=\"$PATH:{install_dir}\"{Colors.NC}")
+        else:
+            log_success(f"{install_dir} is already in your PATH")
+        
+        log_success("Installation complete!")
+        log_info(f"Run 'autocommit --help' to see usage")
+        return True
+        
+    except Exception as e:
+        log_error(f"Installation failed: {e}")
+        return False
+
+def show_help() -> None:
+    """Show help information - shouldn't omit required flags"""
+    show_header(f"autocommit v{VERSION}")
+    
+    print(f"{Colors.GRAY}Automatically checks for tracked files that match .gitignore{Colors.NC}")
+    print()
+    
+    print(f"{Colors.CYAN}Usage:{Colors.NC}")
+    print(f"  {Colors.WHITE}autocommit [OPTIONS]{Colors.NC}")
+    print()
+    
+    show_section("Flags")
+    print(f"  {Colors.GREEN}✓{Colors.NC} {Colors.WHITE}-m, --model MODEL{Colors.NC}    Ollama model to use (default: {DEFAULT_MODEL})")
+    print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}--no-push{Colors.NC}           Don't push after committing")
+    print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}-r, --remote REMOTE{Colors.NC}  Remote to push to (default: {DEFAULT_REMOTE})")
+    print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}-b, --branch BRANCH{Colors.NC}  Branch to push (default: current branch)")
+    print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}--ollama-url URL{Colors.NC}     Ollama API URL (default: {DEFAULT_OLLAMA_URL})")
+    print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}-y, --yes{Colors.NC}           Skip confirmation and auto-accept commit")
+    print(f"  {Colors.BLUE}ℹ{Colors.NC} {Colors.WHITE}--install{Colors.NC}          Install autocommit to system PATH")
+    print(f"  {Colors.BLUE}ℹ{Colors.NC} {Colors.WHITE}--select-model{Colors.NC}     Show available Ollama models and select default")
+    print(f"  {Colors.BLUE}ℹ{Colors.NC} {Colors.WHITE}-h, --help{Colors.NC}         Show this help")
+    print(f"  {Colors.BLUE}ℹ{Colors.NC} {Colors.WHITE}-v, --version{Colors.NC}      Show version")
+    print()
+    
+    show_section("Examples")
+    print(f"  {Colors.GRAY}autocommit{Colors.NC}")
+    print(f"  {Colors.GRAY}autocommit --model qwen2.5-coder:7b-instruct{Colors.NC}")
+    print(f"  {Colors.GRAY}autocommit --no-push --remote upstream --branch develop{Colors.NC}")
+    print(f"  {Colors.GRAY}autocommit -y{Colors.NC}                          # Auto-accept and push")
+    print(f"  {Colors.GRAY}autocommit -y --no-push{Colors.NC}                 # Auto-accept without push")
+    print()
+
+    show_section(".autocommit-ignore")
+    print(f"{Colors.GRAY}Create a .autocommit-ignore file in your repo to exclude files from{Colors.NC}")
+    print(f"{Colors.GRAY}detailed commit messages. Files listed here won't be mentioned in commit messages.{Colors.NC}")
+    print(f"{Colors.GRAY}If ALL changed files are ignored, a default message is used.{Colors.NC}")
+    print()
+    print(f"{Colors.CYAN}Patterns (same syntax as .gitignore):{Colors.NC}")
+    print(f"  {Colors.WHITE}*.log{Colors.NC}                 # Ignore all .log files")
+    print(f"  {Colors.WHITE}*.tmp{Colors.NC}                 # Ignore all .tmp files")
+    print(f"  {Colors.WHITE}node_modules/{Colors.NC}         # Ignore entire directory")
+    print(f"  {Colors.WHITE}build/{Colors.NC}                 # Ignore build directory")
+    print(f"  {Colors.WHITE}dist/{Colors.NC}                  # Ignore dist directory")
+    print(f"  {Colors.WHITE}.env{Colors.NC}                   # Ignore .env file")
+    print(f"  {Colors.WHITE}*.config{Colors.NC}               # Ignore all .config files")
+    print(f"  {Colors.WHITE}*.local{Colors.NC}                # Ignore all .local files")
+    print(f"  {Colors.WHITE}cache/{Colors.NC}                 # Ignore cache directory")
+    print(f"  {Colors.WHITE}*.log.txt{Colors.NC}              # Ignore specific named files")
+    print(f"  {Colors.WHITE}secret.key{Colors.NC}             # Ignore file by exact name")
+    print(f"  {Colors.WHITE}dir/file.txt{Colors.NC}           # Ignore file in specific directory")
+    print(f"  {Colors.WHITE}**/*.pyc{Colors.NC}                # Ignore all .pyc files recursively")
+    print(f"  {Colors.WHITE}!.gitignore{Colors.NC}            # Negation: don't ignore .gitignore")
+    print()
+    print(f"{Colors.GRAY}Example .autocommit-ignore file:{Colors.NC}")
+    print(f"""  {Colors.WHITE}# Logs
+*.log
+logs/
+
+# Dependencies
+node_modules/
+vendor/
+
+# Build outputs
+build/
+dist/
+*.o
+*.class
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache
+cache/
+*.cache
+""")
+
+def main() -> None:
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="Git Auto Committer - Generate commit messages using Ollama",
+        add_help=False
+    )
+    
+    parser.add_argument(
+        "-m", "--model",
+        default=get_default_model(),
+        help=f"Ollama model to use (default: {DEFAULT_MODEL})"
+    )
+    
+    parser.add_argument(
+        "--no-push",
+        action="store_false",
+        dest="push",
+        default=True,
+        help="Don't push after committing"
+    )
+    
+    parser.add_argument(
+        "-r", "--remote",
+        default=DEFAULT_REMOTE,
+        help=f"Remote to push to (default: {DEFAULT_REMOTE})"
+    )
+    
+    parser.add_argument(
+        "--ollama-url",
+        default=DEFAULT_OLLAMA_URL,
+        help=f"Ollama API URL (default: {DEFAULT_OLLAMA_URL})"
+    )
+    
+    parser.add_argument(
+        "-b", "--branch",
+        default=None,
+        help="Branch to push (default: current branch)"
+    )
+    
+    parser.add_argument(
+        "--install",
+        action="store_true",
+        help="Install autocommit to system PATH"
+    )
+    
+    parser.add_argument(
+        "--select-model",
+        action="store_true",
+        help="Show available Ollama models and select default"
+    )
+    
+    parser.add_argument(
+        "-h", "--help",
+        action="store_true",
+        help="Show help message"
+    )
+    
+    parser.add_argument(
+        "-v", "--version",
+        action="store_true",
+        help="Show version"
+    )
+    
+    parser.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        default=False,
+        help="Skip confirmation and auto-accept commit"
+    )
+    
+    # Parse arguments
+    args, unknown = parser.parse_known_args()
+    
+    if args.version:
+        print(f"autocommit v{VERSION}")
+        sys.exit(0)
+    
+    if args.help or unknown:
+        show_help()
+        sys.exit(0 if args.help else 1)
+    
+    # Handle install flag
+    if args.install:
+        success = install_to_path()
+        sys.exit(0 if success else 1)
+    
+    # Handle select-model flag
+    if args.select_model:
+        success = select_model()
+        sys.exit(0 if success else 1)
+    
+    try:
+        committer = GitAutoCommitter(
+            model=args.model,
+            ollama_url=args.ollama_url
+        )
+        
+        success = committer.run(
+            push=args.push,
+            remote=args.remote,
+            branch=args.branch,
+            auto_accept=args.yes
+        )
+        
+        sys.exit(0 if success else 1)
+        
+    except KeyboardInterrupt:
+        log_error("Operation cancelled by user")
+        sys.exit(1)
+    except Exception as e:
+        log_error(f"Unexpected error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
