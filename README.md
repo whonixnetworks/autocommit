@@ -11,6 +11,8 @@ AI-powered Git commit message generator using Ollama models. Automatically analy
 - **Interactive workflow**: Confirms before committing
 - **Automatic staging**: Stages all changes automatically
 - **Push support**: Optionally pushes to remote after commit
+- **Tag & Release**: Create annotated git tags and GitHub releases as part of the workflow
+- **AI-generated release notes**: Automatically generates release notes from diffs
 - **Model selection**: Interactive model selection
 - **Fallback generation**: Works even if Ollama is unavailable
 
@@ -20,6 +22,7 @@ AI-powered Git commit message generator using Ollama models. Automatically analy
 - Git
 - [Ollama](https://ollama.com) installed and running
 - At least one Ollama model
+- [gh CLI](https://cli.github.com) (optional, for `--release` support)
 
 ## Installation
 
@@ -69,16 +72,43 @@ chmod +x autocommit
 autocommit [OPTIONS]
 
 Options:
-  -m, --model MODEL      Ollama model to use (default: llama3.2:3b)
-  --no-push              Don't push after committing
-  -r, --remote REMOTE    Remote to push to (default: origin)
-  -b, --branch BRANCH    Branch to push (default: current branch)
-  --ollama-url URL       Ollama API URL (default: http://127.0.0.1:11434)
-  -y, --yes              Skip confirmation
-  --install              Install to system PATH
-  --select-model        Select default model interactively
-  -h, --help            Show help
-  -v, --version         Show version
+  -m, --model MODEL          Ollama model to use (default: llama3.2:3b)
+  --no-push                  Don't push after committing
+  -r, --remote REMOTE        Remote to push to (default: origin)
+  -b, --branch BRANCH        Branch to push (default: current branch)
+  --ollama-url URL           Ollama API URL (default: http://127.0.0.1:11434)
+  -y, --yes                  Skip confirmation
+  --install                  Install to system PATH
+  --select-model             Select default model interactively
+  -h, --help                 Show help
+  -v, --version              Show version
+
+Tag & Release:
+  --tag VERSION              Create annotated git tag (e.g. v1.2.6 or 1.2.6)
+  --release                  Publish a GitHub release via gh CLI (requires --tag)
+  --release-notes TEXT       Custom release notes (omit for AI-generated)
+  --draft                    Create the release as a draft
+  --prerelease               Mark the release as a pre-release
+  --no-tag-push              Create tag locally without pushing
+```
+
+### Tag & Release Examples
+
+```bash
+# Tag only
+autocommit --tag v1.2.6
+
+# Full release with auto-generated notes
+autocommit -y --tag v1.2.6 --release
+
+# Full release with custom notes
+autocommit -y --tag v1.2.6 --release --release-notes "Fix model fallback bug"
+
+# Draft pre-release
+autocommit -y --tag v1.2.6 --release --draft --prerelease
+
+# Tag locally, don't push
+autocommit --tag v1.2.6 --no-tag-push
 ```
 
 ## Configuration
@@ -112,6 +142,8 @@ dist/
 3. **Confirm**: Shows message and asks for confirmation
 4. **Stage & commit**: Stages changes and creates commit
 5. **Push**: Optionally pushes to remote
+6. **Tag**: Optionally creates an annotated git tag and pushes it
+7. **Release**: Optionally creates a GitHub release (with AI-generated or custom notes)
 
 ## Supported Models
 
