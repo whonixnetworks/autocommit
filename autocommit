@@ -102,19 +102,27 @@ class GitAutoCommitter:
             current = current.parent
         return None
     
-    def run_git_command(self, command: List[str]) -> Tuple[bool, str]:
+    def run_git_command(self, command: List[str], ignore_encoding_errors: bool = False) -> Tuple[bool, str]:
         """Run a git command - shouldn't crash if git fails, should return error details"""
         try:
+            encoding = 'utf-8' if not ignore_encoding_errors else 'utf-8'
+            errors = 'replace' if ignore_encoding_errors else 'strict'
             result = subprocess.run(
                 ["git"] + command,
                 cwd=self.git_dir,
                 capture_output=True,
                 text=True,
+                encoding=encoding,
+                errors=errors,
                 check=True
             )
             return True, result.stdout.strip()
         except subprocess.CalledProcessError as e:
             return False, f"{e.stderr.strip()}\nExit code: {e.returncode}"
+        except UnicodeDecodeError:
+            if ignore_encoding_errors:
+                return False, "Encoding error in git output (binary files present)"
+            raise
     
     def get_git_status(self) -> str:
         """Get git status output."""
@@ -126,13 +134,32 @@ class GitAutoCommitter:
     
     def get_git_diff(self) -> str:
         """Get git diff output."""
-        success, output = self.run_git_command(["diff", "--staged"])
+        success, output = self.run_git_command(["diff", "--staged"], ignore_encoding_errors=True)
         if not success or not output:
-            # Try unstaged diff if no staged changes
-            success, output = self.run_git_command(["diff"])
+            success, output = self.run_git_command(["diff"], ignore_encoding_errors=True)
             if not success:
                 log_error(f"Failed to get git diff: {output}")
                 return ""
+        
+        if not output:
+            return ""
+        
+        if '\0' in output:
+            log_warning("Binary files detected in diff, filtering out binary content")
+            lines = output.split('\n')
+            filtered_lines = []
+            skip_binary = False
+            for line in lines:
+                if 'Binary files' in line or 'GIT binary patch' in line:
+                    skip_binary = True
+                elif skip_binary and (line.startswith(' ') or line.startswith('\t') or not line):
+                    continue
+                elif line:
+                    skip_binary = False
+                if not skip_binary:
+                    filtered_lines.append(line)
+            output = '\n'.join(filtered_lines)
+        
         return output
     
     def get_readme_content(self) -> str:
