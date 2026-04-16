@@ -10,10 +10,9 @@ import subprocess
 import json
 import argparse
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Set
+from typing import Optional, Tuple, List
 import requests
 from datetime import datetime
-import fnmatch
 import re
 
 # CONFIGURATION
@@ -146,52 +145,7 @@ class GitAutoCommitter:
                 log_warning(f"Failed to read README.md: {e}")
         return ""
 
-    def read_autocommit_ignore(self) -> Set[str]:
-        """Read .autocommit-ignore file and return set of patterns."""
-        ignore_file = self.git_dir / ".autocommit-ignore"
-        patterns = set()
-        
-        if ignore_file.exists():
-            try:
-                for line in ignore_file.read_text().split('\n'):
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        patterns.add(line)
-                if patterns:
-                    log_info(f"Loaded {len(patterns)} patterns from .autocommit-ignore")
-            except Exception as e:
-                log_warning(f"Failed to read .autocommit-ignore: {e}")
-        
-        return patterns
 
-    def is_ignored_by_autocommit(self, filename: str, patterns: Set[str]) -> bool:
-        """Check if a file matches any .autocommit-ignore pattern."""
-        for pattern in patterns:
-            # Handle directory patterns (ending with /)
-            if pattern.endswith('/'):
-                dir_path = pattern.rstrip('/')
-                if filename.startswith(dir_path + '/') or filename == dir_path:
-                    return True
-            # Handle wildcard patterns
-            if fnmatch.fnmatch(filename, pattern):
-                return True
-            # Handle prefix match
-            if filename.startswith(pattern.rstrip('/')):
-                return True
-        return False
-
-    def filter_ignored_files(self, files: List[str], patterns: Set[str]) -> Tuple[List[str], List[str]]:
-        """Separate ignored files from non-ignored files."""
-        ignored = []
-        non_ignored = []
-        
-        for f in files:
-            if self.is_ignored_by_autocommit(f, patterns):
-                ignored.append(f)
-            else:
-                non_ignored.append(f)
-        
-        return non_ignored, ignored
 
     def generate_default_message(self) -> str:
         """Generate default commit message with timestamp."""
@@ -208,153 +162,67 @@ class GitAutoCommitter:
         files = [f.strip() for f in tracked_ignored.split('\n') if f.strip()]
         return files
 
-    def suggest_gitignore_fix(self, files: List[str]) -> None:
-        """Show warning and suggest fix for tracked files in .gitignore"""
-        show_section("Gitignore Warning")
-        log_warning(f"Found {len(files)} tracked file(s) that match .gitignore patterns:")
-        
-        for f in files[:10]:  # Show first 10
-            print(f"  {Colors.RED}✗{Colors.NC} {Colors.WHITE}{f}{Colors.NC}")
-        
-        if len(files) > 10:
-            print(f"  {Colors.GRAY}... and {len(files) - 10} more{Colors.NC}")
-        
-        print()
-        log_info("These files should be removed from git tracking:")
-        print(f"{Colors.GRAY}  git rm -r --cached {' '.join(files[:3])} ...{Colors.NC}")
-        print(f"{Colors.GRAY}  git commit -m 'Remove generated files from tracking'{Colors.NC}")
-        print(f"{Colors.GRAY}  git push{Colors.NC}")
-        print()
-        log_info("Continuing with commit anyway...")
-        print()
-
-    def check_autocommit_ignore_tracked(self, patterns: Set[str]) -> List[str]:
-        """Check for files tracked by git that match .autocommit-ignore patterns."""
-        if not patterns:
-            return []
-        
-        success, tracked_files = self.run_git_command(["ls-files"])
-        if not success or not tracked_files:
-            return []
-        
-        tracked = [f.strip() for f in tracked_files.split('\n') if f.strip()]
-        matched = []
-        
-        for filepath in tracked:
-            if self.is_ignored_by_autocommit(filepath, patterns):
-                matched.append(filepath)
-        
-        return matched
-
-    def get_staged_ignored_files(self, patterns: Set[str]) -> List[str]:
-        """Get staged files that match .autocommit-ignore patterns."""
-        if not patterns:
-            return []
-        
-        success, staged = self.run_git_command(["diff", "--staged", "--name-only"])
-        if not success or not staged:
-            return []
-        
-        files = [f.strip() for f in staged.split('\n') if f.strip()]
-        matched = []
-        
-        for filepath in files:
-            if self.is_ignored_by_autocommit(filepath, patterns):
-                matched.append(filepath)
-        
-        return matched
-
-    def remove_tracked_ignored_files(self, files: List[str], auto_accept: bool = False, push: bool = True, remote: str = DEFAULT_REMOTE, branch: Optional[str] = None) -> bool:
-        """Remove tracked files that match .autocommit-ignore patterns from git."""
+    def fix_gitignore_tracked_files(self, files: List[str], auto_accept: bool = False, push: bool = True, remote: str = DEFAULT_REMOTE, branch: Optional[str] = None) -> bool:
+        """Remove tracked files that match .gitignore patterns from git tracking."""
         if not files:
             return True
-        
-        success, status_output = self.run_git_command(["status", "--porcelain"])
-        if not success:
-            log_error(f"Failed to get git status: {status_output}")
-            return False
-        
-        already_tracked = []
-        new_staged = []
-        
-        for f in files:
-            if any(f in line and line.startswith(('M', 'A', 'D', 'R')) for line in status_output.split('\n')):
-                success, ls_files = self.run_git_command(["ls-files", f])
-                if success and ls_files.strip():
-                    already_tracked.append(f)
-                else:
-                    new_staged.append(f)
-        
-        if already_tracked:
-            show_section(".autocommit-ignore Cleanup")
-            log_warning(f"Found {len(already_tracked)} tracked file(s) that match .autocommit-ignore patterns:")
-            
-            for f in already_tracked[:10]:
-                print(f"  {Colors.RED}✗{Colors.NC} {Colors.WHITE}{f}{Colors.NC}")
-            
-            if len(already_tracked) > 10:
-                print(f"  {Colors.GRAY}... and {len(already_tracked) - 10} more{Colors.NC}")
-            
+
+        show_section("Gitignore Cleanup")
+        log_warning(f"Found {len(files)} tracked file(s) that match .gitignore patterns:")
+
+        for f in files[:10]:
+            print(f"  {Colors.RED}✗{Colors.NC} {Colors.WHITE}{f}{Colors.NC}")
+
+        if len(files) > 10:
+            print(f"  {Colors.GRAY}... and {len(files) - 10} more{Colors.NC}")
+
+        print()
+
+        if auto_accept:
+            log_info("Auto-accept enabled (-y), removing files from tracking automatically")
+            should_remove = True
+        else:
+            response = input(f"{Colors.YELLOW}Remove these files from git tracking and commit? y/n: {Colors.NC}").strip().lower()
+            should_remove = response == 'y'
+
+        if not should_remove:
+            log_info("Skipping cleanup, continuing with commit")
             print()
-            
-            if auto_accept:
-                log_info("Auto-accept enabled (-y flag), removing files automatically")
-                should_remove = True
-            else:
-                response = input(f"{Colors.YELLOW}Remove these files from git tracking and push? y/n: {Colors.NC}").strip().lower()
-                should_remove = response == 'y'
-            
-            if not should_remove:
-                log_info("Skipping removal, files will remain tracked")
-                return True
-            
-            for f in already_tracked:
-                self.run_git_command(["rm", "--cached", f])
-            
-            log_success(f"Removed {len(already_tracked)} file(s) from git tracking")
-            
-            success, staged = self.run_git_command(["status", "--porcelain"])
-            if staged.strip():
-                commit_msg = self.generate_default_message()
-                success, output = self.run_git_command(["add", "."])
+            return True
+
+        for f in files:
+            self.run_git_command(["rm", "--cached", f])
+
+        log_success(f"Removed {len(files)} file(s) from git tracking")
+
+        commit_msg = "Remove ignored files from tracking"
+        success, output = self.run_git_command(["commit", "-m", commit_msg])
+        if not success:
+            log_error(f"Failed to commit cleanup: {output}")
+            return False
+
+        log_success("Committed cleanup of ignored files")
+
+        if push:
+            if not branch:
+                success, current_branch = self.run_git_command(["branch", "--show-current"])
                 if not success:
-                    log_error(f"Failed to stage removal: {output}")
+                    log_error(f"Failed to get current branch: {current_branch}")
                     return False
-                success, output = self.run_git_command(["commit", "-m", commit_msg])
-                if not success:
-                    log_error(f"Failed to commit removal: {output}")
-                    return False
-                
-                log_success("Committed removal of ignored files")
-                
-                if push:
-                    if not branch:
-                        success, current_branch = self.run_git_command(["branch", "--show-current"])
-                        if not success:
-                            log_error(f"Failed to get current branch: {current_branch}")
-                            return False
-                        branch = current_branch.strip()
-                    
-                    log_info(f"Pushing removal to {remote}/{branch}")
-                    success, output = self.run_git_command(["push", remote, branch])
-                    if not success:
-                        log_error(f"Failed to push: {output}")
-                        return False
-                    
-                    log_success(f"Pushed removal to {remote}/{branch}")
-        
-        if new_staged:
-            log_info(f"Unstaging {len(new_staged)} new file(s) matching .autocommit-ignore:")
-            for f in new_staged[:5]:
-                print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}{f}{Colors.NC}")
-            
-            for f in new_staged:
-                self.run_git_command(["reset", "HEAD", f])
-            
-            log_success(f"Unstaged {len(new_staged)} file(s) - they will remain local but won't be pushed")
-        
+                branch = current_branch.strip()
+
+            log_info(f"Pushing cleanup to {remote}/{branch}")
+            success, output = self.run_git_command(["push", remote, branch])
+            if not success:
+                log_error(f"Failed to push: {output}")
+                return False
+
+            log_success(f"Pushed cleanup to {remote}/{branch}")
+
+        print()
         return True
-    
+
+
     def extract_file_changes_summary(self, git_diff: str) -> Tuple[str, List[str]]:
         """Extract a clean summary of file changes from git diff - shouldn't include files not in the actual diff"""
         if not git_diff:
@@ -693,7 +561,6 @@ Commit message:"""
         lines = message.strip().split('\n')
         
         if len(lines) == 1:
-            # Single-line message (default message from .autocommit-ignore)
             heading = lines[0].strip()
             subheading = "Updated files"
             body = "Auto-committed changes"
@@ -934,7 +801,6 @@ Release notes:"""
         """Main execution method."""
         show_header("Git Auto Committer")
         
-        # Check if we're in a git repository
         if not self.git_dir:
             log_error("Not in a git repository")
             return False
@@ -942,92 +808,32 @@ Release notes:"""
         log_info(f"Repository: {self.git_dir}")
         log_info(f"Using model: {self.model}")
 
-        # Check for tracked files that should be ignored
         tracked_ignored_files = self.check_gitignore_issues()
         if tracked_ignored_files:
-            self.suggest_gitignore_fix(tracked_ignored_files)
+            if not self.fix_gitignore_tracked_files(tracked_ignored_files, auto_accept, push, remote, branch):
+                return False
 
-        # Read .autocommit-ignore file
-        ignore_patterns = self.read_autocommit_ignore()
-
-        # Get git status first
         git_status = self.get_git_status()
         if not git_status:
             return False
         
-        # Stage changes before getting diff
         if not self.stage_changes():
             return False
         
-        # Check for staged ignored files that are already tracked - prompt for removal
-        if ignore_patterns:
-            staged_ignored = self.get_staged_ignored_files(ignore_patterns)
-            if staged_ignored:
-                if not self.remove_tracked_ignored_files(staged_ignored, auto_accept, push, remote, branch):
-                    return False
-        
-        # Get git diff after staging
         git_diff = self.get_git_diff()
         if not git_diff:
             log_warning("No changes detected")
             return False
         
-        # Extract changed files and filter by .autocommit-ignore
-        _, all_changed_files = self.extract_file_changes_summary(git_diff)
-        non_ignored_files, ignored_files = self.filter_ignored_files(all_changed_files, ignore_patterns)
-        
-        if ignored_files:
-            log_info(f"Ignored files (from .autocommit-ignore): {', '.join(ignored_files[:5])}")
-            if len(ignored_files) > 5:
-                log_info(f"  ... and {len(ignored_files) - 5} more")
-        
         readme_content = self.get_readme_content()
+        commit_message = self.generate_commit_message(git_status, git_diff, readme_content)
+        if not commit_message:
+            return False
         
-        # Determine commit message based on ignored files
-        if ignored_files and not non_ignored_files:
-            # Only ignored files - use default message
-            log_info("Only .autocommit-ignore files changed, using default message")
-            commit_message = self.generate_default_message()
-        elif ignored_files and non_ignored_files:
-            # Both ignored and non-ignored - generate message for non-ignored only
-            log_info(f"Generating commit message for {len(non_ignored_files)} non-ignored file(s)")
-            
-            # Filter git_diff to only include non-ignored files
-            filtered_diff_lines = []
-            current_file = None
-            for line in git_diff.split('\n'):
-                if line.startswith('diff --git'):
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        file_b = parts[3][2:] if parts[3].startswith('b/') else parts[3]
-                        current_file = file_b
-                        if self.is_ignored_by_autocommit(current_file, ignore_patterns):
-                            current_file = None
-                if current_file is not None:
-                    filtered_diff_lines.append(line)
-            
-            filtered_diff = '\n'.join(filtered_diff_lines)
-            
-            # Generate message with filtered diff
-            commit_message = self.generate_commit_message(git_status, filtered_diff, readme_content)
-            if not commit_message:
-                return False
-        else:
-            # No ignored files - normal behavior
-            commit_message = self.generate_commit_message(git_status, git_diff, readme_content)
-            if not commit_message:
-                return False
-        
-        # Ask for confirmation
         show_section("Confirmation")
-        is_default = ignored_files and not non_ignored_files
-        if is_default:
-            print(f"{Colors.YELLOW}Generated commit message (default - only ignored files):{Colors.NC}")
-        else:
-            print(f"{Colors.YELLOW}Generated commit message (3-part format):{Colors.NC}")
+        print(f"{Colors.YELLOW}Generated commit message (3-part format):{Colors.NC}")
         print()
         
-        # Parse and display the 3-part message
         lines = commit_message.strip().split('\n')
         if len(lines) >= 2:
             print(f"{Colors.CYAN}Heading:{Colors.NC}")
@@ -1042,7 +848,6 @@ Release notes:"""
                     print(f"  {Colors.GRAY}{line}{Colors.NC}")
                 print()
         else:
-            # Fallback display
             print(f"{Colors.WHITE}{commit_message}{Colors.NC}")
             print()
         
@@ -1053,20 +858,16 @@ Release notes:"""
             
             if response != 'y':
                 log_warning("Operation cancelled by user")
-                # Undo staged changes
                 self.run_git_command(["reset", "--mixed", "HEAD"])
                 return False
         
-        # Commit changes
         if not self.commit_changes(commit_message):
             return False
         
-        # Push changes if requested
         if push:
             if not self.push_changes(remote, branch):
                 return False
 
-        # Tag and release workflow
         if tag_version:
             normalized = self.normalize_version(tag_version)
             self._pending_tag_version = normalized
@@ -1290,7 +1091,7 @@ def show_help() -> None:
     """Show help information - shouldn't omit required flags"""
     show_header(f"autocommit v{VERSION}")
     
-    print(f"{Colors.GRAY}Automatically checks for tracked files that match .gitignore{Colors.NC}")
+    print(f"{Colors.GRAY}Automatically removes tracked files that match .gitignore patterns{Colors.NC}")
     print()
     
     print(f"{Colors.CYAN}Usage:{Colors.NC}")
@@ -1335,59 +1136,6 @@ def show_help() -> None:
     print(f"  {Colors.GRAY}autocommit -y --new-release --draft --prerelease{Colors.NC}")
     print(f"  {Colors.GRAY}autocommit --tag v1.2.6 --no-tag-push{Colors.NC}   # Tag locally only")
     print()
-
-    show_section(".autocommit-ignore")
-    print(f"{Colors.GRAY}Create a .autocommit-ignore file in your repo to exclude files from{Colors.NC}")
-    print(f"{Colors.GRAY}detailed commit messages. Files listed here won't be mentioned in commit messages.{Colors.NC}")
-    print(f"{Colors.GRAY}If ALL changed files are ignored, a default message is used.{Colors.NC}")
-    print()
-    print(f"{Colors.CYAN}Patterns (same syntax as .gitignore):{Colors.NC}")
-    print(f"  {Colors.WHITE}*.log{Colors.NC}                 # Ignore all .log files")
-    print(f"  {Colors.WHITE}*.tmp{Colors.NC}                 # Ignore all .tmp files")
-    print(f"  {Colors.WHITE}node_modules/{Colors.NC}         # Ignore entire directory")
-    print(f"  {Colors.WHITE}build/{Colors.NC}                 # Ignore build directory")
-    print(f"  {Colors.WHITE}dist/{Colors.NC}                  # Ignore dist directory")
-    print(f"  {Colors.WHITE}.env{Colors.NC}                   # Ignore .env file")
-    print(f"  {Colors.WHITE}*.config{Colors.NC}               # Ignore all .config files")
-    print(f"  {Colors.WHITE}*.local{Colors.NC}                # Ignore all .local files")
-    print(f"  {Colors.WHITE}cache/{Colors.NC}                 # Ignore cache directory")
-    print(f"  {Colors.WHITE}*.log.txt{Colors.NC}              # Ignore specific named files")
-    print(f"  {Colors.WHITE}secret.key{Colors.NC}             # Ignore file by exact name")
-    print(f"  {Colors.WHITE}dir/file.txt{Colors.NC}           # Ignore file in specific directory")
-    print(f"  {Colors.WHITE}**/*.pyc{Colors.NC}                # Ignore all .pyc files recursively")
-    print(f"  {Colors.WHITE}!.gitignore{Colors.NC}            # Negation: don't ignore .gitignore")
-    print()
-    print(f"{Colors.GRAY}Example .autocommit-ignore file:{Colors.NC}")
-    print(f"""  {Colors.WHITE}# Logs
-*.log
-logs/
-
-# Dependencies
-node_modules/
-vendor/
-
-# Build outputs
-build/
-dist/
-*.o
-*.class
-
-# Environment
-.env
-.env.local
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Cache
-cache/
-*.cache
-""")
 
 def main() -> None:
     """Main entry point."""

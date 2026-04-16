@@ -121,21 +121,7 @@ Configuration is stored in `~/.config/autocommit/config.json`:
 }
 ```
 
-## `.autocommit-ignore`
-
-Create a `.autocommit-ignore` file in your repository to exclude files from commit messages:
-
-```
-*.log
-logs/
-node_modules/
-build/
-dist/
-.env
-*.tmp
-```
-
-## How It Works
+## Configuration
 
 1. **Analyze changes**: Reads git diff, status, and README.md
 2. **Generate message**: Sends context to Ollama model

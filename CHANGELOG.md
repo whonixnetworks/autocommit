@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- Removed `.autocommit-ignore` file support (use `.gitignore` instead)
+- Automatic cleanup of tracked files matching `.gitignore` patterns (runs `git rm -r --cached` automatically with `-y` flag)
+- Simplified workflow - single source of truth for ignore patterns
+
 ## [1.2.5] - 2025-04-15
 
 ### Added
