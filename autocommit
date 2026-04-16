@@ -14,6 +14,7 @@ from typing import Optional, Tuple, List, Dict, Set
 import requests
 from datetime import datetime
 import fnmatch
+import re
 
 # CONFIGURATION
 DEFAULT_MODEL = "llama3.2:3b"  # Alternative: "qwen2.5:3b" or "qwen2.5-coder:7b-instruct"
@@ -516,8 +517,6 @@ Commit message:"""
                             commit_message = commit_message[1:].strip()
                 
                 # Remove section labels (TITLE, SUBTITLE, BODY, and their variants)
-                import re
-                # Pattern to match "TITLE:", "SUBTITLE:", "BODY:" at start of lines (case insensitive)
                 commit_message = re.sub(r'(?im)^\s*(title|subtitle|body)\s*:?\s*', '', commit_message)
                 
                 # Parse the 3-part format: Heading, Subheading, Body
@@ -772,6 +771,37 @@ Commit message:"""
             log_error(f"Failed to push: {output}")
             return False
     
+    def get_latest_tag(self) -> Optional[str]:
+        """Get the latest semver tag from git, or None if no tags exist."""
+        success, output = self.run_git_command(["tag", "--sort=-v:refname"])
+        if not success or not output:
+            return None
+        for line in output.split('\n'):
+            tag = line.strip()
+            if tag and re.match(r'^v?\d+\.\d+\.\d+$', tag):
+                return tag
+        return None
+
+    def bump_version(self, version: str, bump_type: str = "patch") -> str:
+        """Bump a semver version string. Accepts versions with or without 'v' prefix."""
+        v_prefix = version.startswith('v')
+        clean = version.lstrip('v')
+        parts = clean.split('.')
+        if len(parts) != 3:
+            raise ValueError(f"Invalid version format: {version}")
+        major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
+        if bump_type == "major":
+            major += 1
+            minor = 0
+            patch = 0
+        elif bump_type == "minor":
+            minor += 1
+            patch = 0
+        else:
+            patch += 1
+        result = f"{major}.{minor}.{patch}"
+        return f"v{result}" if v_prefix else result
+
     def normalize_version(self, version: str) -> str:
         if not version:
             return version
@@ -1281,6 +1311,8 @@ def show_help() -> None:
     print()
     
     show_section("Tag & Release Flags")
+    print(f"  {Colors.GREEN}✓{Colors.NC} {Colors.WHITE}--new-release{Colors.NC}        Auto-bump version, tag, and release (easiest option)")
+    print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}--bump TYPE{Colors.NC}           Bump type: major, minor, or patch (default: patch)")
     print(f"  {Colors.GREEN}✓{Colors.NC} {Colors.WHITE}--tag VERSION{Colors.NC}        Create annotated git tag (e.g. v1.2.6 or 1.2.6)")
     print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}--release{Colors.NC}             Publish a GitHub release via gh CLI (requires --tag)")
     print(f"  {Colors.YELLOW}○{Colors.NC} {Colors.WHITE}--release-notes TEXT{Colors.NC}  Custom release notes (omit for AI-generated)")
@@ -1295,9 +1327,12 @@ def show_help() -> None:
     print(f"  {Colors.GRAY}autocommit --no-push --remote upstream --branch develop{Colors.NC}")
     print(f"  {Colors.GRAY}autocommit -y{Colors.NC}                          # Auto-accept and push")
     print(f"  {Colors.GRAY}autocommit -y --no-push{Colors.NC}                 # Auto-accept without push")
-    print(f"  {Colors.GRAY}autocommit --tag v1.2.6{Colors.NC}                 # Tag only")
-    print(f"  {Colors.GRAY}autocommit -y --tag v1.2.6 --release{Colors.NC}    # Tag + release")
-    print(f"  {Colors.GRAY}autocommit -y --tag v1.2.6 --release --draft --prerelease{Colors.NC}")
+    print(f"  {Colors.GRAY}autocommit -y --new-release{Colors.NC}             # Patch bump + tag + release")
+    print(f"  {Colors.GRAY}autocommit -y --new-release --bump minor{Colors.NC}  # Minor bump + tag + release")
+    print(f"  {Colors.GRAY}autocommit -y --new-release --bump major{Colors.NC}  # Major bump + tag + release")
+    print(f"  {Colors.GRAY}autocommit --tag v1.2.6{Colors.NC}                 # Tag only (manual version)")
+    print(f"  {Colors.GRAY}autocommit -y --tag v1.2.6 --release{Colors.NC}    # Tag + release (manual version)")
+    print(f"  {Colors.GRAY}autocommit -y --new-release --draft --prerelease{Colors.NC}")
     print(f"  {Colors.GRAY}autocommit --tag v1.2.6 --no-tag-push{Colors.NC}   # Tag locally only")
     print()
 
@@ -1425,6 +1460,20 @@ def main() -> None:
     )
     
     parser.add_argument(
+        "--new-release",
+        action="store_true",
+        default=False,
+        help="Auto-bump version from latest tag and create tag + release (implies --tag --release)"
+    )
+
+    parser.add_argument(
+        "--bump",
+        default="patch",
+        choices=["major", "minor", "patch"],
+        help="Version bump type for --new-release (default: patch)"
+    )
+
+    parser.add_argument(
         "--tag",
         default=None,
         metavar="VERSION",
@@ -1488,32 +1537,49 @@ def main() -> None:
         sys.exit(0 if success else 1)
     
     # Validate flag combinations
-    if args.release and not args.tag:
-        log_error("--release requires --tag to specify a version")
+    if args.release and not args.tag and not args.new_release:
+        log_error("--release requires --tag or --new-release to specify a version")
         sys.exit(1)
-    
-    if args.draft and not args.release:
-        log_warning("--draft has no effect without --release")
-    
-    if args.prerelease and not args.release:
-        log_warning("--prerelease has no effect without --release")
-    
-    if args.release_notes and not args.release:
-        log_warning("--release-notes has no effect without --release")
+
+    if args.new_release and args.tag:
+        log_error("--new-release and --tag are mutually exclusive")
+        sys.exit(1)
+
+    if args.draft and not args.release and not args.new_release:
+        log_warning("--draft has no effect without --release or --new-release")
+
+    if args.prerelease and not args.release and not args.new_release:
+        log_warning("--prerelease has no effect without --release or --new-release")
+
+    if args.release_notes and not args.release and not args.new_release:
+        log_warning("--release-notes has no effect without --release or --new-release")
     
     try:
         committer = GitAutoCommitter(
             model=args.model,
             ollama_url=args.ollama_url
         )
-        
+
+        if args.new_release:
+            latest_tag = committer.get_latest_tag()
+            if latest_tag:
+                tag_version = committer.bump_version(latest_tag, args.bump)
+                log_info(f"Latest tag: {latest_tag}, bumping ({args.bump}) -> {tag_version}")
+            else:
+                tag_version = committer.normalize_version(f"v{VERSION}")
+                log_info(f"No existing tags found, using script version: {tag_version}")
+            do_release = True
+        else:
+            tag_version = args.tag
+            do_release = args.release
+
         success = committer.run(
             push=args.push,
             remote=args.remote,
             branch=args.branch,
             auto_accept=args.yes,
-            tag_version=args.tag,
-            release=args.release,
+            tag_version=tag_version,
+            release=do_release,
             release_notes=args.release_notes,
             draft=args.draft,
             prerelease=args.prerelease,
