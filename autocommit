@@ -726,6 +726,37 @@ Commit message:"""
             log_error(f"Failed to push tag: {output}")
             return False
 
+    def update_script_version(self, version: str) -> bool:
+        """Update VERSION in the autocommit script and related files."""
+        clean_version = version.lstrip('v')
+        log_info(f"Updating script version to {clean_version}")
+
+        script_path = self.git_dir / "autocommit"
+        if not script_path.exists():
+            log_warning(f"Script not found at {script_path}, skipping version update")
+            return False
+
+        try:
+            content = script_path.read_text()
+            new_content = re.sub(
+                r'^VERSION = "[^"]*"',
+                f'VERSION = "{clean_version}"',
+                content,
+                flags=re.MULTILINE
+            )
+            new_content = re.sub(
+                r'^# Version: \S+',
+                f'# Version: {clean_version}',
+                new_content,
+                flags=re.MULTILINE
+            )
+            script_path.write_text(new_content)
+            log_success("Updated autocommit script version")
+            return True
+        except Exception as e:
+            log_warning(f"Failed to update script version: {e}")
+            return False
+
     def check_gh_cli(self) -> bool:
         try:
             result = subprocess.run(
@@ -900,10 +931,12 @@ Release notes:"""
             self._pending_tag_version = normalized
 
             if normalized.lstrip('v') != VERSION:
-                log_warning(f"Tag version {normalized} does not match script VERSION v{VERSION}")
+                log_info(f"Updating script VERSION from v{VERSION} to {normalized.lstrip('v')}")
 
             if not self.create_tag(normalized):
                 return False
+
+            self.update_script_version(normalized)
 
             if not no_tag_push:
                 if not self.push_tag(normalized, remote):
